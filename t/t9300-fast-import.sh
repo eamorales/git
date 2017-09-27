@@ -3120,4 +3120,133 @@ test_expect_success 'U: validate root delete result' '
 	compare_diff_raw expect actual
 '
 
+###
+### series V (checkpoint)
+###
+
+# To make sure you're observing the side effects of checkpoint *before*
+# fast-import terminates (and thus writes out its state), check that the
+# fast-import process is still running using background_import_still_running
+# *after* evaluating the test conditions.
+background_import_until_checkpoint () {
+	options=$1
+	input_file=$2
+
+	mkfifo V.input
+	exec 8<>V.input
+	rm V.input
+
+	mkfifo V.output
+	exec 9<>V.output
+	rm V.output
+
+	cat $input_file >&8
+	git fast-import $options <&8 >&9 &
+	echo $! >V.pid
+	test_when_finished "kill $(cat V.pid) || true"
+
+	error=0
+	if read output <&9
+	then
+		if ! test "$output" = "progress checkpoint"
+		then
+			echo >&2 "no progress checkpoint received: $output"
+			error=1
+		fi
+	else
+		echo >&2 "failed to read fast-import output"
+		error=1
+	fi
+
+	exec 8>&-
+	exec 9>&-
+
+	if test $error -eq 1
+	then
+		exit 1
+	fi
+}
+
+background_import_still_running () {
+	if ! kill -0 "$(cat V.pid)"
+	then
+		echo >&2 "background fast-import terminated too early"
+		exit 1
+	fi
+}
+
+test_expect_success 'V: checkpoint updates refs after reset' '
+	cat >input <<-\INPUT_END &&
+	reset refs/heads/V
+	from refs/heads/U
+
+	checkpoint
+	progress checkpoint
+	INPUT_END
+
+	background_import_until_checkpoint "" input &&
+	test "$(git rev-parse --verify V)" = "$(git rev-parse --verify U)" &&
+	background_import_still_running
+'
+
+test_expect_success 'V: checkpoint updates refs and marks after commit' '
+	cat >input <<-INPUT_END &&
+	commit refs/heads/V
+	mark :1
+	committer $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> $GIT_COMMITTER_DATE
+	data 0
+	from refs/heads/U
+
+	checkpoint
+	progress checkpoint
+	INPUT_END
+
+	background_import_until_checkpoint "--export-marks=marks.actual" input &&
+
+	echo ":1 $(git rev-parse --verify V)" >marks.expected &&
+
+	test "$(git rev-parse --verify V^)" = "$(git rev-parse --verify U)" &&
+	test_cmp marks.expected marks.actual &&
+	background_import_still_running
+'
+
+# Re-create the exact same commit, but on a different branch: no new object is
+# created in the database, but the refs and marks still need to be updated.
+test_expect_success 'V: checkpoint updates refs and marks after commit (no new objects)' '
+	cat >input <<-INPUT_END &&
+	commit refs/heads/V2
+	mark :2
+	committer $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> $GIT_COMMITTER_DATE
+	data 0
+	from refs/heads/U
+
+	checkpoint
+	progress checkpoint
+	INPUT_END
+
+	background_import_until_checkpoint "--export-marks=marks.actual" input &&
+
+	echo ":2 $(git rev-parse --verify V2)" >marks.expected &&
+
+	test "$(git rev-parse --verify V2)" = "$(git rev-parse --verify V)" &&
+	test_cmp marks.expected marks.actual &&
+	background_import_still_running
+'
+
+test_expect_success 'V: checkpoint updates tags after tag' '
+	cat >input <<-INPUT_END &&
+	tag Vtag
+	from refs/heads/V
+	tagger $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> $GIT_COMMITTER_DATE
+	data 0
+
+	checkpoint
+	progress checkpoint
+	INPUT_END
+
+	background_import_until_checkpoint "" input &&
+	git show-ref -d Vtag &&
+	background_import_still_running
+'
+
 test_done
